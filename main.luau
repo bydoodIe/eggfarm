@@ -4,7 +4,7 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local Window = Rayfield:CreateWindow({
     Name = "Easter Egg Auto-Farm",
     LoadingTitle = "Easter Eggs",
-    LoadingSubtitle = "Smart Recalc v4",
+    LoadingSubtitle = "Smooth Fly v5",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
@@ -30,7 +30,6 @@ local farmSpeed  = 16
 local currentTarget = nil
 local espCache = {}
 
---// Pathfinding
 local path = PathfindingService:CreatePath({
     AgentRadius = 2,
     AgentHeight = 5,
@@ -46,22 +45,17 @@ local navState = "idle" -- idle / path / direct
 local lastPos = Vector3.zero
 local stuckTimer = 0
 local recalcTimer = 0
-local RECALC_INTERVAL = 0.3 -- пересчёт ближайшего яйца каждые 0.3 сек
+local unstuckBoost = 0
+local RECALC_INTERVAL = 0.3
 
---// Respawn handler
+--// Respawn
 plr.CharacterAdded:Connect(function(c)
-    char = c
-    hrp  = c:WaitForChild("HumanoidRootPart")
-    hum  = c:WaitForChild("Humanoid")
-    currentWaypoints = {}
-    wpIndex = 1
-    navState = "idle"
-    currentTarget = nil
-    stuckTimer = 0
-    recalcTimer = 0
+    char = c; hrp = c:WaitForChild("HumanoidRootPart"); hum = c:WaitForChild("Humanoid")
+    currentWaypoints = {}; wpIndex = 1; navState = "idle"
+    currentTarget = nil; stuckTimer = 0; recalcTimer = 0; unstuckBoost = 0
 end)
 
---// Получить ВСЕ яйца прямо сейчас
+--// Получить яйца
 local function getEggs()
     local eggs = {}
     local folder = workspace:FindFirstChild("EasterEggs")
@@ -75,21 +69,17 @@ local function getEggs()
     return eggs
 end
 
---// Ближайшее яйцо (absolute)
+--// Ближайшее яйцо
 local function getClosestEgg(fromPos)
     local eggs = getEggs()
     if #eggs == 0 then return nil, math.huge end
     local closest, minDist = nil, math.huge
     fromPos = fromPos or (hrp and hrp.Position)
     if not fromPos then return nil, math.huge end
-
     for _, egg in ipairs(eggs) do
         if not egg or not egg.Parent then continue end
         local d = (egg.Position - fromPos).Magnitude
-        if d < minDist then
-            minDist = d
-            closest = egg
-        end
+        if d < minDist then minDist = d; closest = egg end
     end
     return closest, minDist
 end
@@ -98,9 +88,7 @@ end
 local function computePath(target)
     currentWaypoints = {}; wpIndex = 1
     if not target or not hrp then return false end
-    local ok = pcall(function()
-        path:ComputeAsync(hrp.Position, target.Position)
-    end)
+    local ok = pcall(function() path:ComputeAsync(hrp.Position, target.Position) end)
     if ok and path.Status == Enum.PathStatus.Success then
         currentWaypoints = path:GetWaypoints()
         return #currentWaypoints > 0
@@ -108,94 +96,101 @@ local function computePath(target)
     return false
 end
 
---// Raycast вперёд
+--// Raycast в направлении движения
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-
-local function forwardRay(dist)
-    if not hrp then return nil end
+local function rayDir(origin, dir, dist)
     rayParams.FilterDescendantsInstances = {char}
-    return workspace:Raycast(hrp.Position, hrp.CFrame.LookVector * dist, rayParams)
+    return workspace:Raycast(origin, dir.Unit * dist, rayParams)
 end
 
---// ==================== HEARTBEAT (core logic) ====================
+--// Управление физикой персонажа
+local function setFarmPhysics(enabled)
+    if not hum then return end
+    if enabled then
+        hum:ChangeState(Enum.HumanoidStateType.Physics)
+        hum.AutoRotate = false
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    else
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+        hum.AutoRotate = true
+        if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = true end
+        end
+    end
+end
+
+--// ==================== CORE HEARTBEAT ====================
 RunService.Heartbeat:Connect(function(dt)
     if not autoFarm then
         if navState ~= "idle" then
-            navState = "idle"
-            currentTarget = nil
-            currentWaypoints = {}
-            if hum then
-                hum.PlatformStand = false
-                hum.AutoRotate = true
-            end
-            if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
-            for _, p in ipairs(char:GetDescendants()) do
-                if p:IsA("BasePart") then p.CanCollide = true end
-            end
+            setFarmPhysics(false)
+            navState = "idle"; currentTarget = nil; currentWaypoints = {}
+            stuckTimer = 0; recalcTimer = 0; unstuckBoost = 0
         end
         return
     end
 
-    if not hrp or not char then return end
+    if not hrp or not char or not hum then return end
 
-    -- Noclip + отрубаем Humanoid (он мешает скорости)
-    for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") then p.CanCollide = false end
-    end
-    if hum then
-        hum.PlatformStand = true
-        hum.AutoRotate = false
+    -- Включаем физику фарма (один раз)
+    if navState == "idle" and not currentTarget then
+        setFarmPhysics(true)
     end
 
-    --// ===== 1. ПЕРИОДИЧЕСКИЙ ПЕРЕСЧЁТ ЦЕЛИ (ФИКС) =====
+    --// 1. ПРИНУДИТЕЛЬНЫЙ ПЕРЕСЧЁТ ЦЕЛИ КАЖДЫЕ 0.3 сек
     recalcTimer += dt
     if recalcTimer >= RECALC_INTERVAL then
         recalcTimer = 0
         local bestEgg, bestDist = getClosestEgg()
-
         if bestEgg then
             if not currentTarget or not currentTarget.Parent then
-                -- Нет цели — берём лучшую
                 currentTarget = bestEgg
                 navState = "idle"
             else
                 local oldDist = (currentTarget.Position - hrp.Position).Magnitude
-                -- Гистерезис в 5 studs, чтобы не дёргался между двумя одинаково близкими
                 if bestDist < oldDist - 5 then
                     currentTarget = bestEgg
-                    navState = "idle" -- force rebuild path к новой цели
+                    navState = "idle" -- новая цель = новый путь
                 end
             end
         else
             currentTarget = nil
-            navState = "idle"
         end
     end
 
-    --// ===== 2. НЕТ ЦЕЛИ =====
+    --// 2. НЕТ ЦЕЛИ
     if not currentTarget or not currentTarget.Parent then
         currentTarget = getClosestEgg()
         navState = "idle"
-        if not currentTarget then return end
+        if not currentTarget then hrp.AssemblyLinearVelocity = Vector3.zero; return end
     end
 
-    --// ===== 3. ANTI-STUCK (Застрял в текстуре?) =====
+    --// 3. ANTI-STUCK (если не двигаемся — плавно всплываем)
     local moved = (hrp.Position - lastPos).Magnitude
     if moved < 0.3 then
         stuckTimer += dt
-        if stuckTimer > 0.5 then
-            -- Рывок: вверх + чуть вперёд — вытаскиваем из текстуры/горы
-            hrp.Position = hrp.Position + Vector3.new(0, 40, 0) + (hrp.CFrame.LookVector * 10)
+        if stuckTimer > 0.6 then
+            unstuckBoost = 0.25 -- 0.25 секунды рывок вверх
             stuckTimer = 0
-            navState = "idle" -- перестроить путь от новой позиции
+            navState = "idle" -- перестроить путь после всплытия
         end
     else
         stuckTimer = 0
     end
     lastPos = hrp.Position
 
-    --// ===== 4. ВЫБОР НАВИГАЦИИ =====
+    --// 4. РЫВОК ИЗ ТЕКСТУРЫ (всплытие)
+    if unstuckBoost > 0 then
+        unstuckBoost -= dt
+        hrp.AssemblyLinearVelocity = Vector3.new(0, 70, 0)
+        return
+    end
+
+    --// 5. ВЫБОР НАВИГАЦИИ
     if navState == "idle" then
         if computePath(currentTarget) then
             navState = "path"
@@ -204,33 +199,31 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    --// ===== 5. PATHFINDING MODE (обходит горы/стены по земле) =====
+    --// 6. PATHFINDING (по земле, обходит горы)
     if navState == "path" and wpIndex <= #currentWaypoints then
         local wp = currentWaypoints[wpIndex]
         local distWP = (wp.Position - hrp.Position).Magnitude
 
-        if distWP < 3.5 then
+        if distWP < 4 then
             wpIndex += 1
             if wpIndex > #currentWaypoints then
-                -- Конец пути — дошли ли до яйца?
                 if (currentTarget.Position - hrp.Position).Magnitude < 7 then
                     currentTarget = nil -- собрали
                 else
-                    navState = "idle" -- перестроить
+                    navState = "idle"
                 end
             end
         else
             local dir = (wp.Position - hrp.Position).Unit
-            -- Если вдруг на пути появилась динамическая стена
-            if forwardRay(5) then
+            -- Если на пути встала динамическая стена — переключаемся
+            if rayDir(hrp.Position, dir, 5) then
                 navState = "direct"
             else
-                hrp.CFrame = CFrame.lookAt(hrp.Position, wp.Position)
-                hrp.Position = hrp.Position + dir * farmSpeed * dt
+                hrp.AssemblyLinearVelocity = dir * farmSpeed
             end
         end
 
-    --// ===== 6. DIRECT FLY MODE (облёт препятствий) =====
+    --// 7. DIRECT FLY (сквозь воздух, облет препятствий)
     elseif navState == "direct" then
         local tPos = currentTarget.Position
         local dist = (tPos - hrp.Position).Magnitude
@@ -238,17 +231,17 @@ RunService.Heartbeat:Connect(function(dt)
         if dist < 4 then
             currentTarget = nil
             navState = "idle"
+            hrp.AssemblyLinearVelocity = Vector3.zero
         else
             local dir = (tPos - hrp.Position).Unit
-            local hit = forwardRay(7)
+            local hit = rayDir(hrp.Position, dir, 6)
 
             if hit then
-                -- Впереди стена/гора — перелетаем через неё (рывок вверх-вперёд)
-                hrp.Position = hrp.Position + Vector3.new(0, 35, 0) + (dir * 8)
-                hrp.CFrame = CFrame.lookAt(hrp.Position, tPos)
+                -- Впереди стена/гора — летим вверх-вперёд чтобы перелететь
+                local upDir = Vector3.new(dir.X * 0.6, 1, dir.Z * 0.6).Unit
+                hrp.AssemblyLinearVelocity = upDir * farmSpeed
             else
-                hrp.CFrame = CFrame.lookAt(hrp.Position, tPos)
-                hrp.Position = hrp.Position + dir * farmSpeed * dt
+                hrp.AssemblyLinearVelocity = dir * farmSpeed
             end
         end
     end
@@ -263,16 +256,13 @@ local function makeESP(egg)
     hl.OutlineColor = Color3.fromRGB(255, 215, 0)
     hl.FillTransparency = 0.4
     hl.OutlineTransparency = 0
-    hl.Adornee = egg
-    hl.Parent = egg
+    hl.Adornee = egg; hl.Parent = egg
     hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 
     local bb = Instance.new("BillboardGui")
     bb.Size = UDim2.new(0, 120, 0, 50)
     bb.StudsOffset = Vector3.new(0, 3, 0)
-    bb.AlwaysOnTop = true
-    bb.Adornee = egg
-    bb.Parent = egg
+    bb.AlwaysOnTop = true; bb.Adornee = egg; bb.Parent = egg
 
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(1, 0, 1, 0)
@@ -323,8 +313,9 @@ MainTab:CreateToggle({
     Callback = function(v)
         autoFarm = v
         if not v then
+            setFarmPhysics(false)
             navState = "idle"; currentTarget = nil; currentWaypoints = {}
-            stuckTimer = 0; recalcTimer = 0
+            stuckTimer = 0; recalcTimer = 0; unstuckBoost = 0
         end
     end
 })
@@ -361,4 +352,4 @@ SetTab:CreateSlider({
 --// Anti-AFK
 for _, c in pairs(getconnections(plr.Idled)) do c:Disable() end
 
-Rayfield:Notify({ Title = "Loaded v4", Content = "Auto-recalc + Anti-stuck ready!", Duration = 5 })
+Rayfield:Notify({ Title = "Loaded v5", Content = "Smooth camera + smart fly ready!", Duration = 5 })
