@@ -32,17 +32,18 @@ local CONFIG = {
     ESP = true,
     ESPColor = Color3.fromRGB(255, 105, 180),
     ESPTextSize = 14,
-    CollectionRadius = 12,      -- Увеличено с 8 до 12
-    AgentRadius = 3.5,          -- Увеличено для меньшего числа точек
+    CollectionRadius = 12,
+    AgentRadius = 3.5,
     AgentHeight = 5,
     AgentCanJump = true,
     VisualizePath = true,
     PathColor = Color3.fromRGB(255, 255, 0),
     IgnoreCollected = true,
-    CheckInterval = 0.5,        -- Увеличено с 0.2 для стабильности
+    CheckInterval = 1.0,        -- Увеличено с 0.5 до 1.0 сек
     MaxSearchRadius = 1000,
+    PathCooldown = 2.0,         -- Минимум секунд между постройками пути
+    MinDirectWalk = 20,         -- Если ближе этого — идём напрямую без Pathfinding
     
-    -- === ПАПКА С ЯЙЦАМИ ===
     EggFolder = Workspace:WaitForChild("EasterEggs", 10)
 }
 
@@ -53,7 +54,9 @@ local State = {
     CollectedEggs = {},
     ESPObjects = {},
     PathVisuals = {},
-    LastCheck = 0
+    LastPathBuild = 0,          -- Время последней постройки пути
+    LastArrivalTime = 0,        -- Время последнего прибытия к яйцу
+    TargetBlacklist = {}        -- Яйца, к которым недавно приходили
 }
 
 -- ==================== УТИЛИТЫ ====================
@@ -98,7 +101,6 @@ function isEggAvailable(egg)
     
     local id = getEggID(egg)
     
-    -- Кэш 30 секунд
     if State.CollectedEggs[id] then
         if tick() - State.CollectedEggs[id] > 30 then
             State.CollectedEggs[id] = nil
@@ -139,6 +141,26 @@ function markAsCollected(egg)
     if not egg then return end
     State.CollectedEggs[getEggID(egg)] = tick()
     State.CurrentTarget = nil
+end
+
+function blacklistTarget(egg)
+    -- Чтобы не пытался идти к тому же яйцу сразу после неудачи
+    if egg then
+        State.TargetBlacklist[getEggID(egg)] = tick()
+    end
+end
+
+function isBlacklisted(egg)
+    if not egg then return true end
+    local id = getEggID(egg)
+    if State.TargetBlacklist[id] then
+        if tick() - State.TargetBlacklist[id] > 5 then
+            State.TargetBlacklist[id] = nil
+            return false
+        end
+        return true
+    end
+    return false
 end
 
 -- ==================== ПОИСК ЯИЦ ====================
@@ -185,6 +207,8 @@ function getNearestEgg()
     local myPos = hrp.Position
     
     for _, egg in ipairs(eggs) do
+        if isBlacklisted(egg) then continue end
+        
         local pos = getPosition(egg)
         if pos then
             local dist = (myPos - pos).Magnitude
@@ -309,7 +333,7 @@ function updateESP()
     end
 end
 
--- ==================== PATHFINDING (ИСПРАВЛЕННЫЙ) ====================
+-- ==================== PATHFINDING (ФИКС ПЕРЕСТРОЕК) ====================
 
 function clearPathVisuals()
     for _, part in ipairs(State.PathVisuals) do
@@ -337,9 +361,11 @@ function drawPath(waypoints)
     end
 end
 
-function walkTo(targetPos, onArrive)
+-- ПРОСТОЕ ДВИЖЕНИЕ (без PathfindingService) — для близких расстояний
+function walkDirect(targetPos, onArrive)
     if State.IsMoving then return false end
     State.IsMoving = true
+    State.LastPathBuild = tick()
     
     local char, hum, hrp = getCharacter()
     if not hum then 
@@ -347,7 +373,72 @@ function walkTo(targetPos, onArrive)
         return false 
     end
     
-    local originalSpeed = hum.WalkSpeed
+    hum:MoveTo(targetPos)
+    
+    local arrived = false
+    local stuckTimer = 0
+    local lastPos = hrp.Position
+    
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        if not State.IsMoving then
+            if conn then conn:Disconnect() end
+            return
+        end
+        
+        local _, _, currentHrp = getCharacter()
+        if not currentHrp then
+            arrived = true
+            State.IsMoving = false
+            if conn then conn:Disconnect() end
+            return
+        end
+        
+        local dist = (currentHrp.Position - targetPos).Magnitude
+        if dist < 3 then
+            arrived = true
+            State.IsMoving = false
+            if conn then conn:Disconnect() end
+            return
+        end
+        
+        -- Anti-stuck
+        if (currentHrp.Position - lastPos).Magnitude < 0.15 then
+            stuckTimer += dt
+            if stuckTimer > 2 then
+                arrived = true
+                State.IsMoving = false
+                if conn then conn:Disconnect() end
+                return
+            end
+        else
+            stuckTimer = 0
+            lastPos = currentHrp.Position
+        end
+        
+        -- Обновляем направление раз в 0.3 сек
+        hum:MoveTo(targetPos)
+    end)
+    
+    repeat task.wait(0.1) until not State.IsMoving
+    if conn then conn:Disconnect() end
+    
+    State.LastArrivalTime = tick()
+    if onArrive then onArrive() end
+    return true
+end
+
+-- Pathfinding (только для далёких целей)
+function walkPathfind(targetPos, onArrive)
+    if State.IsMoving then return false end
+    State.IsMoving = true
+    State.LastPathBuild = tick()
+    
+    local char, hum, hrp = getCharacter()
+    if not hum then 
+        State.IsMoving = false
+        return false 
+    end
     
     local path = PathfindingService:CreatePath({
         AgentRadius = CONFIG.AgentRadius,
@@ -361,39 +452,20 @@ function walkTo(targetPos, onArrive)
         path:ComputeAsync(hrp.Position, targetPos)
     end)
     
-    -- Fallback: прямое движение без waypoints
     if not success or path.Status ~= Enum.PathStatus.Success then
-        hum:MoveTo(targetPos)
-        local arrived = false
-        local conn
-        conn = RunService.Heartbeat:Connect(function()
-            local _, _, currentHrp = getCharacter()
-            if not currentHrp then
-                arrived = true
-                if conn then conn:Disconnect() end
-                return
-            end
-            if (currentHrp.Position - targetPos).Magnitude < 5 then
-                arrived = true
-                if conn then conn:Disconnect() end
-            end
-        end)
-        
-        repeat task.wait() until arrived
         State.IsMoving = false
-        if onArrive then onArrive() end
-        return true
+        return walkDirect(targetPos, onArrive) -- Фолбэк
     end
     
     local waypoints = path:GetWaypoints()
     if #waypoints < 2 then
         State.IsMoving = false
-        return false
+        return walkDirect(targetPos, onArrive)
     end
     
     drawPath(waypoints)
     
-    -- ФИЛЬТРУЕМ точки: убираем первую и слишком близкие (меньше 4 studs)
+    -- Убираем близкие точки для плавности
     local filteredPoints = {}
     for i = 2, #waypoints do
         local wp = waypoints[i]
@@ -417,7 +489,6 @@ function walkTo(targetPos, onArrive)
     local lastPos = hrp.Position
     local stuckTimer = 0
     
-    -- ГЛАВНЫЙ ЦИКЛ: Heartbeat вместо MoveToFinished
     local heartbeatConn
     heartbeatConn = RunService.Heartbeat:Connect(function(dt)
         if not State.IsMoving or blocked then
@@ -431,7 +502,6 @@ function walkTo(targetPos, onArrive)
             return
         end
         
-        -- Проверяем, не украли ли яйцо по дороге
         if State.CurrentTarget and not isEggAvailable(State.CurrentTarget) then
             State.IsMoving = false
             return
@@ -445,10 +515,9 @@ function walkTo(targetPos, onArrive)
         
         local dist = (currentHrp.Position - target.Position).Magnitude
         
-        -- Anti-stuck: если стоим на месте > 1.5 сек
-        if (currentHrp.Position - lastPos).Magnitude < 0.2 then
+        if (currentHrp.Position - lastPos).Magnitude < 0.15 then
             stuckTimer += dt
-            if stuckTimer > 1.5 then
+            if stuckTimer > 2 then
                 State.IsMoving = false
                 return
             end
@@ -457,7 +526,6 @@ function walkTo(targetPos, onArrive)
             lastPos = currentHrp.Position
         end
         
-        -- Достигли точки (допуск 3 studs, не 0!)
         if dist < 3 then
             currentPointIdx += 1
             if currentPointIdx > #filteredPoints then
@@ -467,16 +535,13 @@ function walkTo(targetPos, onArrive)
             target = filteredPoints[currentPointIdx]
         end
         
-        -- ПЛАВНОЕ движение: просто обновляем направление, не ждём остановки!
         hum:MoveTo(target.Position)
         
-        -- Авто-прыжок
         if target.Action == Enum.PathWaypointAction.Jump then
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
         end
     end)
     
-    -- Ждём завершения
     while State.IsMoving do
         task.wait(0.05)
     end
@@ -485,9 +550,24 @@ function walkTo(targetPos, onArrive)
     if heartbeatConn then heartbeatConn:Disconnect() end
     clearPathVisuals()
     
-    hum.WalkSpeed = originalSpeed
+    State.LastArrivalTime = tick()
     if onArrive then onArrive() end
     return true
+end
+
+-- Универсальная функция движения
+function walkTo(targetPos, egg, onArrive)
+    local _, _, hrp = getCharacter()
+    if not hrp then return false end
+    
+    local dist = (hrp.Position - targetPos).Magnitude
+    
+    -- БЛИЗКО: идём напрямую, не трогаем PathfindingService
+    if dist < CONFIG.MinDirectWalk then
+        return walkDirect(targetPos, onArrive)
+    else
+        return walkPathfind(targetPos, onArrive)
+    end
 end
 
 -- ==================== СБОР ЯЙЦА ====================
@@ -501,19 +581,16 @@ function collectEgg(egg)
     local char = player.Character
     if not char then return false end
     
-    -- ProximityPrompt
     local prompt = egg:FindFirstChildWhichIsA("ProximityPrompt", true)
     if prompt then
         pcall(fireproximityprompt, prompt)
     end
     
-    -- ClickDetector
     local click = egg:FindFirstChildWhichIsA("ClickDetector", true)
     if click then
         pcall(fireclickdetector, click)
     end
     
-    -- Touch
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local part = egg:IsA("BasePart") and egg or egg:FindFirstChildWhichIsA("BasePart")
     if hrp and part then
@@ -524,7 +601,6 @@ function collectEgg(egg)
         end)
     end
     
-    -- Проверяем результат
     task.wait(0.3)
     if not egg.Parent then
         markAsCollected(egg)
@@ -539,7 +615,7 @@ function collectEgg(egg)
     return false
 end
 
--- ==================== ГЛАВНЫЙ ЦИКЛ ====================
+-- ==================== ГЛАВНЫЙ ЦИКЛ (ФИКС) ====================
 
 function mainLoop()
     while true do
@@ -559,9 +635,27 @@ function mainLoop()
         
         updateESP()
         
+        -- Если уже двигаемся — пропускаем
         if State.IsMoving then continue end
         
+        -- КУЛДАУН: не строим путь чаще чем раз в PathCooldown секунд
+        if tick() - State.LastPathBuild < CONFIG.PathCooldown then
+            continue
+        end
+        
+        -- КУЛДАУН: если только что пришли к яйцу — подождём 1 сек
+        if tick() - State.LastArrivalTime < 1 then
+            continue
+        end
+        
         local egg, dist = getNearestEgg()
+        
+        -- Если текущая цель та же, но мы недавно были рядом — не идём повторно
+        if egg and State.CurrentTarget == egg and tick() - State.LastArrivalTime < 3 then
+            blacklistTarget(egg)
+            State.CurrentTarget = nil
+            continue
+        end
         
         if egg and isEggAvailable(egg) then
             State.CurrentTarget = egg
@@ -569,13 +663,26 @@ function mainLoop()
             
             if eggPos then
                 if dist > CONFIG.CollectionRadius then
-                    walkTo(eggPos, function()
+                    -- Выбираем метод движения внутри walkTo
+                    walkTo(eggPos, egg, function()
+                        -- Прибыл
                         if egg and egg.Parent and isEggAvailable(egg) then
-                            collectEgg(egg)
+                            local collected = collectEgg(egg)
+                            if not collected then
+                                -- Не собралось — блеклистим на 5 сек
+                                blacklistTarget(egg)
+                            end
                         end
+                        State.CurrentTarget = nil
                     end)
                 else
-                    collectEgg(egg)
+                    -- Уже рядом — просто собираем
+                    local collected = collectEgg(egg)
+                    if not collected then
+                        blacklistTarget(egg)
+                    end
+                    State.CurrentTarget = nil
+                    State.LastArrivalTime = tick()
                 end
             end
         else
@@ -584,7 +691,7 @@ function mainLoop()
     end
 end
 
--- ==================== UI ЭЛЕМЕНТЫ ====================
+-- ==================== UI ====================
 
 MainTab:CreateToggle({
     Name = "Auto Collect",
@@ -613,6 +720,18 @@ MainTab:CreateSlider({
     Flag = "CollectionRadius",
     Callback = function(Value)
         CONFIG.CollectionRadius = Value
+    end
+})
+
+MainTab:CreateSlider({
+    Name = "Min Pathfinding Distance",
+    Range = {10, 50},
+    Increment = 5,
+    Suffix = "studs",
+    CurrentValue = 20,
+    Flag = "MinDirectWalk",
+    Callback = function(Value)
+        CONFIG.MinDirectWalk = Value
     end
 })
 
@@ -652,6 +771,18 @@ VisualTab:CreateToggle({
 })
 
 SettingsTab:CreateSlider({
+    Name = "Path Cooldown",
+    Range = {0.5, 5},
+    Increment = 0.5,
+    Suffix = "sec",
+    CurrentValue = 2.0,
+    Flag = "PathCooldown",
+    Callback = function(Value)
+        CONFIG.PathCooldown = Value
+    end
+})
+
+SettingsTab:CreateSlider({
     Name = "Max Search Radius",
     Range = {50, 2000},
     Increment = 50,
@@ -663,25 +794,14 @@ SettingsTab:CreateSlider({
     end
 })
 
-SettingsTab:CreateSlider({
-    Name = "Check Speed",
-    Range = {0.2, 2},
-    Increment = 0.1,
-    Suffix = "s",
-    CurrentValue = 0.5,
-    Flag = "CheckInterval",
-    Callback = function(Value)
-        CONFIG.CheckInterval = Value
-    end
-})
-
 SettingsTab:CreateButton({
     Name = "Reset Collected Cache",
     Callback = function()
         State.CollectedEggs = {}
+        State.TargetBlacklist = {}
         Rayfield:Notify({
             Title = "Cache Reset",
-            Content = "Collected eggs memory cleared!",
+            Content = "All cooldowns cleared!",
             Duration = 3
         })
     end
@@ -694,6 +814,6 @@ task.spawn(mainLoop)
 local initialEggs = findAllEggs()
 Rayfield:Notify({
     Title = "EasterEggs Loaded",
-    Content = "Found " .. #initialEggs .. " eggs in Workspace.EasterEggs",
+    Content = "Found " .. #initialEggs .. " eggs. Cooldown system active.",
     Duration = 5
 })
