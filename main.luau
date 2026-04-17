@@ -32,8 +32,8 @@ local CONFIG = {
     ESPColor = Color3.fromRGB(255, 105, 180),
     ESPTextSize = 14,
     CollectionRadius = 12,
-    AgentRadius = 3.5,
-    AgentHeight = 5,
+    AgentRadius = 2,              -- ИЗМЕНЕНО: было 3.5, лучше для склонов/узких мест
+    AgentHeight = 4,              -- ИЗМЕНЕНО: было 5, чуть ниже — лучше заходит в двери/под мосты
     AgentCanJump = true,
     VisualizePath = true,
     PathColor = Color3.fromRGB(255, 255, 0),
@@ -41,7 +41,11 @@ local CONFIG = {
     CheckInterval = 0.5,
     MaxSearchRadius = 1000,
     PathCooldown = 1.5,
-    MinDirectWalk = 25,
+    MinDirectWalk = 15,           -- ИЗМЕНЕНО: было 25, чаще используем паффайндинг
+    HeightThreshold = 8,          -- НОВОЕ: если разница в высоте больше этого, форсируем паффайндинг
+    StuckJumpTimer = 1.5,         -- НОВОЕ: через сколько секунд застревания прыгать
+    MaxStuckTime = 5,             -- НОВОЕ: сколько секунд ждать перед отменой пути
+    PathFailCooldown = 10,        -- НОВОЕ: сколько секунд игнорировать яйцо, если путь не построился
     EggFolder = Workspace:WaitForChild("EasterEggs", 10)
 }
 
@@ -56,7 +60,9 @@ local State = {
     PathVisuals = {},
     LastPathBuild = 0,
     LastArrivalTime = 0,
-    MoveStartedAt = 0
+    MoveStartedAt = 0,
+    FailedPaths = {},             -- НОВОЕ: яйца, к которым не удалось построить путь
+    TargetAttempts = 0            -- НОВОЕ: счётчик попыток сбора текущей цели
 }
 
 -- ==================== УТИЛИТЫ ====================
@@ -102,15 +108,33 @@ local function lockTarget(egg, pos)
     State.CurrentTargetPos = pos
     State.TargetLocked = true
     State.MoveStartedAt = tick()
+    State.TargetAttempts = 0
 end
 
 local function unlockTarget()
     State.CurrentTarget = nil
     State.CurrentTargetPos = nil
     State.TargetLocked = false
+    State.TargetAttempts = 0
 end
 
 -- ==================== ПРОВЕРКА ДОСТУПНОСТИ ====================
+
+-- НОВАЯ ФУНКЦИЯ: проверяет, не слишком ли крутой подъём для прямой ходьбы
+local function isDirectPathClear(startPos, endPos)
+    local heightDiff = endPos.Y - startPos.Y
+    local horizontalDist = Vector3.new(endPos.X - startPos.X, 0, endPos.Z - startPos.Z).Magnitude
+    
+    -- Если горизонтальное расстояние мало, считаем ок
+    if horizontalDist < 2 then return true end
+    
+    -- Если подъём слишком крутой (более ~50 градусов) — лучше обойти через паффайндинг
+    if heightDiff > 3 and heightDiff / horizontalDist > 1.2 then
+        return false
+    end
+    
+    return true
+end
 
 local function isEggAvailable(egg)
     if not CONFIG.IgnoreCollected then
@@ -119,6 +143,15 @@ local function isEggAvailable(egg)
 
     if not egg or not egg.Parent then
         return false
+    end
+
+    -- НОВОЕ: проверяем, не в кулдауне ли яйцо из-за неудачного пути
+    if State.FailedPaths[egg] then
+        if tick() - State.FailedPaths[egg] < CONFIG.PathFailCooldown then
+            return false
+        else
+            State.FailedPaths[egg] = nil
+        end
     end
 
     local seenAt = State.CollectedEggs[egg]
@@ -179,14 +212,6 @@ local function findAllEggs()
     for _, obj in ipairs(folder:GetDescendants()) do
         if isValidEgg(obj) and isEggAvailable(obj) then
             table.insert(eggs, obj)
-        end
-    end
-
-    for _, obj in ipairs(folder:GetChildren()) do
-        if isValidEgg(obj) and isEggAvailable(obj) then
-            if not table.find(eggs, obj) then
-                table.insert(eggs, obj)
-            end
         end
     end
 
@@ -370,6 +395,7 @@ local function walkDirect(targetPos)
 
     local lastPos = hrp.Position
     local stuckTimer = 0
+    local jumpTimer = 0  -- НОВОЕ: отдельный таймер для прыжков
 
     local conn
     conn = RunService.Heartbeat:Connect(function(dt)
@@ -394,13 +420,22 @@ local function walkDirect(targetPos)
 
         if (currentHrp.Position - lastPos).Magnitude < 0.15 then
             stuckTimer += dt
-            if stuckTimer > 4 then
+            jumpTimer += dt
+            
+            -- НОВОЕ: если застряли на склоне/бордюре — прыгаем
+            if jumpTimer >= CONFIG.StuckJumpTimer then
+                hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                jumpTimer = 0  -- сброс, чтобы не спамить прыжками
+            end
+            
+            if stuckTimer > CONFIG.MaxStuckTime then
                 State.IsMoving = false
                 if conn then conn:Disconnect() end
                 return
             end
         else
             stuckTimer = 0
+            jumpTimer = 0
             lastPos = currentHrp.Position
         end
 
@@ -440,7 +475,7 @@ local function walkPathfind(targetPos)
 
     if not success or path.Status ~= Enum.PathStatus.Success then
         State.IsMoving = false
-        return walkDirect(targetPos)
+        return false  -- НЕ вызываем walkDirect здесь, пусть mainLoop решит
     end
 
     local waypoints = path:GetWaypoints()
@@ -467,6 +502,7 @@ local function walkPathfind(targetPos)
     local currentPointIdx = 1
     local lastPos = hrp.Position
     local stuckTimer = 0
+    local jumpTimer = 0
 
     local heartbeatConn
     heartbeatConn = RunService.Heartbeat:Connect(function(dt)
@@ -497,13 +533,22 @@ local function walkPathfind(targetPos)
 
         if (currentHrp.Position - lastPos).Magnitude < 0.15 then
             stuckTimer += dt
-            if stuckTimer > 4 then
+            jumpTimer += dt
+            
+            -- НОВОЕ: прыжок при застревании на склоне/ступеньке
+            if jumpTimer >= CONFIG.StuckJumpTimer then
+                hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                jumpTimer = 0
+            end
+            
+            if stuckTimer > CONFIG.MaxStuckTime then
                 State.IsMoving = false
                 if heartbeatConn then heartbeatConn:Disconnect() end
                 return
             end
         else
             stuckTimer = 0
+            jumpTimer = 0
             lastPos = currentHrp.Position
         end
 
@@ -535,6 +580,7 @@ local function walkPathfind(targetPos)
     return true
 end
 
+-- ИЗМЕНЁННАЯ ФУНКЦИЯ: теперь учитывает высоту и крутизну
 local function walkTo(targetPos, egg)
     local _, _, hrp = getCharacter()
     if not hrp then return false end
@@ -542,7 +588,10 @@ local function walkTo(targetPos, egg)
     lockTarget(egg, targetPos)
 
     local dist = (hrp.Position - targetPos).Magnitude
-    if dist < CONFIG.MinDirectWalk then
+    local heightDiff = math.abs(targetPos.Y - hrp.Position.Y)
+    
+    -- ИСПРАВЛЕНИЕ: если цель слишком высоко/низко, далеко, или путь крутой — используем паффайндинг
+    if dist < CONFIG.MinDirectWalk and heightDiff < CONFIG.HeightThreshold and isDirectPathClear(hrp.Position, targetPos) then
         return walkDirect(targetPos)
     else
         return walkPathfind(targetPos)
@@ -639,8 +688,23 @@ local function mainLoop()
             continue
         end
 
+        -- ИСПРАВЛЕНИЕ: если цель уже заблокирована и валидна, не ищем новую
         local targetEgg = State.CurrentTarget
         local targetPos = State.CurrentTargetPos
+
+        if targetEgg and targetEgg.Parent and isEggAvailable(targetEgg) then
+            -- Обновляем позицию на случай, если яйцо двинулось
+            local freshPos = getPosition(targetEgg)
+            if freshPos then
+                targetPos = freshPos
+                State.CurrentTargetPos = freshPos
+            end
+        else
+            -- Цель недоступна, сбрасываем и ищем новую
+            unlockTarget()
+            targetEgg = nil
+            targetPos = nil
+        end
 
         if not targetPos then
             local egg = getNearestEgg()
@@ -657,14 +721,34 @@ local function mainLoop()
             local dist = (hrp.Position - targetPos).Magnitude
 
             if dist > CONFIG.CollectionRadius then
-                walkTo(targetPos, targetEgg)
+                local success = walkTo(targetPos, targetEgg)
+                -- НОВОЕ: если не удалось дойти (застряли/не построился путь), помечаем яйцо
+                if not success and targetEgg then
+                    State.FailedPaths[targetEgg] = tick()
+                    unlockTarget()
+                    task.wait(0.5)
+                end
             else
                 if targetEgg then
-                    collectEgg(targetEgg)
-                    markAsCollected(targetEgg)
+                    local collected = collectEgg(targetEgg)
+                    if collected then
+                        markAsCollected(targetEgg)
+                        unlockTarget()
+                        State.LastArrivalTime = tick()
+                    else
+                        -- Не удалось собрать — даём 3 попытки, потом идём к другому
+                        State.TargetAttempts += 1
+                        if State.TargetAttempts > 3 then
+                            State.FailedPaths[targetEgg] = tick()
+                            unlockTarget()
+                            State.LastArrivalTime = tick()
+                        else
+                            task.wait(0.3)
+                        end
+                    end
+                else
+                    unlockTarget()
                 end
-                unlockTarget()
-                State.LastArrivalTime = tick()
             end
         end
     end
@@ -707,7 +791,7 @@ MainTab:CreateSlider({
     Range = {10, 50},
     Increment = 5,
     Suffix = "studs",
-    CurrentValue = 25,
+    CurrentValue = 15,
     Flag = "MinDirectWalk",
     Callback = function(Value)
         CONFIG.MinDirectWalk = Value
@@ -779,6 +863,8 @@ SettingsTab:CreateButton({
     Name = "Reset Collected Cache",
     Callback = function()
         State.CollectedEggs = setmetatable({}, { __mode = "k" })
+        State.FailedPaths = {}  -- НОВОЕ: сбрасываем и кэш неудачных путей
+        unlockTarget()
         Rayfield:Notify({
             Title = "Cache Reset",
             Content = "All collected egg cache cleared!",
@@ -794,6 +880,6 @@ task.spawn(mainLoop)
 local initialEggs = findAllEggs()
 Rayfield:Notify({
     Title = "EasterEggs Loaded",
-    Content = "Found " .. #initialEggs .. " eggs. Walk to target no matter what!",
+    Content = "Found " .. #initialEggs .. " eggs. Improved slope/path handling active!",
     Duration = 5
 })
