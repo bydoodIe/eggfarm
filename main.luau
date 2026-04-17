@@ -30,20 +30,20 @@ local SettingsTab = Window:CreateTab("Settings", 4483362458)
 local CONFIG = {
     Enabled = false,
     ESP = true,
-    ESPColor = Color3.fromRGB(255, 105, 180), -- Розовый для пасхальных яиц
+    ESPColor = Color3.fromRGB(255, 105, 180),
     ESPTextSize = 14,
-    CollectionRadius = 8,
-    AgentRadius = 2.5,
+    CollectionRadius = 12,      -- Увеличено с 8 до 12
+    AgentRadius = 3.5,          -- Увеличено для меньшего числа точек
     AgentHeight = 5,
     AgentCanJump = true,
-    VisualizePath = false,
+    VisualizePath = true,
     PathColor = Color3.fromRGB(255, 255, 0),
     IgnoreCollected = true,
-    CheckInterval = 0.2,
+    CheckInterval = 0.5,        -- Увеличено с 0.2 для стабильности
     MaxSearchRadius = 1000,
     
-    -- === ОСНОВНАЯ ПАПКА С ЯЙЦАМИ ===
-    EggFolder = Workspace:WaitForChild("EasterEggs", 10) -- Ждём загрузки до 10 сек
+    -- === ПАПКА С ЯЙЦАМИ ===
+    EggFolder = Workspace:WaitForChild("EasterEggs", 10)
 }
 
 -- ==================== СОСТОЯНИЕ ====================
@@ -83,7 +83,6 @@ end
 function isValidEgg(obj)
     if not (obj:IsA("BasePart") or obj:IsA("Model")) then return false end
     if not obj.Parent then return false end
-    -- Пасхальные яйца могут называться по-разному, собираем всё из папки
     return true
 end
 
@@ -99,7 +98,7 @@ function isEggAvailable(egg)
     
     local id = getEggID(egg)
     
-    -- Проверяем кэш (30 сек защита от повторного сбора)
+    -- Кэш 30 секунд
     if State.CollectedEggs[id] then
         if tick() - State.CollectedEggs[id] > 30 then
             State.CollectedEggs[id] = nil
@@ -108,7 +107,6 @@ function isEggAvailable(egg)
         return false
     end
     
-    -- Проверяем, не собрал ли кто-то другой
     if egg:IsA("BasePart") then
         if egg.Transparency >= 1 then
             State.CollectedEggs[id] = tick()
@@ -120,7 +118,6 @@ function isEggAvailable(egg)
         end
     end
     
-    -- Проверка для Model: ищем видимые части
     if egg:IsA("Model") then
         local visible = false
         for _, part in ipairs(egg:GetDescendants()) do
@@ -151,7 +148,6 @@ function findAllEggs()
     local folder = CONFIG.EggFolder
     
     if not folder or not folder.Parent then 
-        -- Пытаемся найти папку снова
         local success, result = pcall(function()
             return Workspace:WaitForChild("EasterEggs", 2)
         end)
@@ -169,7 +165,6 @@ function findAllEggs()
         end
     end
     
-    -- Также проверяем прямые дети (если яйца лежат сразу в папке)
     for _, obj in ipairs(folder:GetChildren()) do
         if isValidEgg(obj) and isEggAvailable(obj) then
             if not table.find(eggs, obj) then
@@ -194,7 +189,6 @@ function getNearestEgg()
         if pos then
             local dist = (myPos - pos).Magnitude
             if dist < minDist then
-                -- Лучевая проверка (опционально, можно убрать если лагает)
                 local rayParams = RaycastParams.new()
                 rayParams.FilterDescendantsInstances = {char}
                 rayParams.FilterType = Enum.RaycastFilterType.Blacklist
@@ -236,7 +230,6 @@ function createESP(egg)
     label.TextStrokeTransparency = 0.3
     label.Text = "🥚 " .. egg.Name .. "\n...m"
     
-    -- Фон для читаемости
     local bg = Instance.new("Frame")
     bg.Name = "Bg"
     bg.BackgroundColor3 = Color3.new(0, 0, 0)
@@ -307,7 +300,6 @@ function updateESP()
         createESP(egg)
     end
     
-    -- Чистим исчезнувшие
     for egg, data in pairs(State.ESPObjects) do
         if not egg.Parent or not isEggAvailable(egg) then
             data.Gui:Destroy()
@@ -317,7 +309,7 @@ function updateESP()
     end
 end
 
--- ==================== PATHFINDING ====================
+-- ==================== PATHFINDING (ИСПРАВЛЕННЫЙ) ====================
 
 function clearPathVisuals()
     for _, part in ipairs(State.PathVisuals) do
@@ -355,6 +347,8 @@ function walkTo(targetPos, onArrive)
         return false 
     end
     
+    local originalSpeed = hum.WalkSpeed
+    
     local path = PathfindingService:CreatePath({
         AgentRadius = CONFIG.AgentRadius,
         AgentHeight = CONFIG.AgentHeight,
@@ -367,11 +361,28 @@ function walkTo(targetPos, onArrive)
         path:ComputeAsync(hrp.Position, targetPos)
     end)
     
+    -- Fallback: прямое движение без waypoints
     if not success or path.Status ~= Enum.PathStatus.Success then
-        -- Fallback
         hum:MoveTo(targetPos)
+        local arrived = false
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            local _, _, currentHrp = getCharacter()
+            if not currentHrp then
+                arrived = true
+                if conn then conn:Disconnect() end
+                return
+            end
+            if (currentHrp.Position - targetPos).Magnitude < 5 then
+                arrived = true
+                if conn then conn:Disconnect() end
+            end
+        end)
+        
+        repeat task.wait() until arrived
         State.IsMoving = false
-        return false
+        if onArrive then onArrive() end
+        return true
     end
     
     local waypoints = path:GetWaypoints()
@@ -382,46 +393,104 @@ function walkTo(targetPos, onArrive)
     
     drawPath(waypoints)
     
-    local blockedConn = path.Blocked:Connect(function(blockedIdx)
-        if blockedIdx >= 2 then
-            State.IsMoving = false
+    -- ФИЛЬТРУЕМ точки: убираем первую и слишком близкие (меньше 4 studs)
+    local filteredPoints = {}
+    for i = 2, #waypoints do
+        local wp = waypoints[i]
+        if i == #waypoints or (wp.Position - hrp.Position).Magnitude > 4 then
+            table.insert(filteredPoints, wp)
         end
+    end
+    
+    if #filteredPoints == 0 then
+        State.IsMoving = false
+        return false
+    end
+    
+    local blocked = false
+    local blockedConn = path.Blocked:Connect(function()
+        blocked = true
+        State.IsMoving = false
     end)
     
-    for i = 2, #waypoints do
-        if not State.IsMoving then break end
+    local currentPointIdx = 1
+    local lastPos = hrp.Position
+    local stuckTimer = 0
+    
+    -- ГЛАВНЫЙ ЦИКЛ: Heartbeat вместо MoveToFinished
+    local heartbeatConn
+    heartbeatConn = RunService.Heartbeat:Connect(function(dt)
+        if not State.IsMoving or blocked then
+            if heartbeatConn then heartbeatConn:Disconnect() end
+            return
+        end
+        
+        local _, _, currentHrp = getCharacter()
+        if not currentHrp then
+            State.IsMoving = false
+            return
+        end
         
         -- Проверяем, не украли ли яйцо по дороге
         if State.CurrentTarget and not isEggAvailable(State.CurrentTarget) then
             State.IsMoving = false
-            break
+            return
         end
         
-        local wp = waypoints[i]
-        
-        if wp.Action == Enum.PathWaypointAction.Jump then
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
-            task.wait(0.1)
-        end
-        
-        hum:MoveTo(wp.Position)
-        local reached = hum.MoveToFinished:Wait()
-        
-        if not reached then
+        local target = filteredPoints[currentPointIdx]
+        if not target then
             State.IsMoving = false
-            break
+            return
         end
+        
+        local dist = (currentHrp.Position - target.Position).Magnitude
+        
+        -- Anti-stuck: если стоим на месте > 1.5 сек
+        if (currentHrp.Position - lastPos).Magnitude < 0.2 then
+            stuckTimer += dt
+            if stuckTimer > 1.5 then
+                State.IsMoving = false
+                return
+            end
+        else
+            stuckTimer = 0
+            lastPos = currentHrp.Position
+        end
+        
+        -- Достигли точки (допуск 3 studs, не 0!)
+        if dist < 3 then
+            currentPointIdx += 1
+            if currentPointIdx > #filteredPoints then
+                State.IsMoving = false
+                return
+            end
+            target = filteredPoints[currentPointIdx]
+        end
+        
+        -- ПЛАВНОЕ движение: просто обновляем направление, не ждём остановки!
+        hum:MoveTo(target.Position)
+        
+        -- Авто-прыжок
+        if target.Action == Enum.PathWaypointAction.Jump then
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end)
+    
+    -- Ждём завершения
+    while State.IsMoving do
+        task.wait(0.05)
     end
     
     if blockedConn then blockedConn:Disconnect() end
+    if heartbeatConn then heartbeatConn:Disconnect() end
     clearPathVisuals()
-    State.IsMoving = false
     
+    hum.WalkSpeed = originalSpeed
     if onArrive then onArrive() end
     return true
 end
 
--- ==================== СБОР ====================
+-- ==================== СБОР ЯЙЦА ====================
 
 function collectEgg(egg)
     if not egg or not egg.Parent then 
@@ -456,13 +525,12 @@ function collectEgg(egg)
     end
     
     -- Проверяем результат
-    task.wait(0.2)
+    task.wait(0.3)
     if not egg.Parent then
         markAsCollected(egg)
         return true
     end
     
-    -- Повторная проверка через прозрачность
     if egg:IsA("BasePart") and egg.Transparency >= 1 then
         markAsCollected(egg)
         return true
@@ -516,7 +584,7 @@ function mainLoop()
     end
 end
 
--- ==================== UI ====================
+-- ==================== UI ЭЛЕМЕНТЫ ====================
 
 MainTab:CreateToggle({
     Name = "Auto Collect",
@@ -538,10 +606,10 @@ MainTab:CreateToggle({
 
 MainTab:CreateSlider({
     Name = "Collection Radius",
-    Range = {3, 20},
+    Range = {3, 25},
     Increment = 1,
     Suffix = "studs",
-    CurrentValue = 8,
+    CurrentValue = 12,
     Flag = "CollectionRadius",
     Callback = function(Value)
         CONFIG.CollectionRadius = Value
@@ -575,7 +643,7 @@ VisualTab:CreateColorPicker({
 
 VisualTab:CreateToggle({
     Name = "Show Path",
-    CurrentValue = false,
+    CurrentValue = true,
     Flag = "VisualizePath",
     Callback = function(Value)
         CONFIG.VisualizePath = Value
@@ -597,10 +665,10 @@ SettingsTab:CreateSlider({
 
 SettingsTab:CreateSlider({
     Name = "Check Speed",
-    Range = {0.1, 1},
+    Range = {0.2, 2},
     Increment = 0.1,
     Suffix = "s",
-    CurrentValue = 0.2,
+    CurrentValue = 0.5,
     Flag = "CheckInterval",
     Callback = function(Value)
         CONFIG.CheckInterval = Value
