@@ -50,11 +50,13 @@ local State = {
     IsMoving = false,
     CurrentTarget = nil,
     CurrentTargetPos = nil,
-    CollectedEggs = setmetatable({}, { __mode = "k" }), -- кэш по экземпляру
+    TargetLocked = false,
+    CollectedEggs = setmetatable({}, { __mode = "k" }),
     ESPObjects = {},
     PathVisuals = {},
     LastPathBuild = 0,
-    LastArrivalTime = 0
+    LastArrivalTime = 0,
+    MoveStartedAt = 0
 }
 
 -- ==================== УТИЛИТЫ ====================
@@ -93,6 +95,19 @@ local function isValidEgg(obj)
         return false
     end
     return true
+end
+
+local function lockTarget(egg, pos)
+    State.CurrentTarget = egg
+    State.CurrentTargetPos = pos
+    State.TargetLocked = true
+    State.MoveStartedAt = tick()
+end
+
+local function unlockTarget()
+    State.CurrentTarget = nil
+    State.CurrentTargetPos = nil
+    State.TargetLocked = false
 end
 
 -- ==================== ПРОВЕРКА ДОСТУПНОСТИ ====================
@@ -185,7 +200,8 @@ local function getNearestEgg()
     end
 
     local eggs = findAllEggs()
-    local nearest, minDist = nil, CONFIG.MaxSearchRadius
+    local nearest = nil
+    local minDist = CONFIG.MaxSearchRadius
     local myPos = hrp.Position
 
     for _, egg in ipairs(eggs) do
@@ -236,7 +252,8 @@ local function createESP(egg)
 
     label.Parent = billboard
 
-    local connection = RunService.Heartbeat:Connect(function()
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
         if not egg or not egg.Parent or not CONFIG.ESP then
             if billboard then billboard:Destroy() end
             State.ESPObjects[egg] = nil
@@ -305,7 +322,7 @@ local function updateESP()
     end
 end
 
--- ==================== PATH VISUALS ====================
+-- ==================== ПУТЬ ====================
 
 local function clearPathVisuals()
     for _, part in ipairs(State.PathVisuals) do
@@ -341,7 +358,7 @@ local function walkDirect(targetPos)
     if State.IsMoving then return false end
     State.IsMoving = true
     State.LastPathBuild = tick()
-    State.CurrentTargetPos = targetPos
+    State.MoveStartedAt = tick()
 
     local _, hum, hrp = getCharacter()
     if not hum or not hrp then
@@ -369,7 +386,7 @@ local function walkDirect(targetPos)
         end
 
         local dist = (currentHrp.Position - targetPos).Magnitude
-        if dist < 3 then
+        if dist <= CONFIG.CollectionRadius then
             State.IsMoving = false
             if conn then conn:Disconnect() end
             return
@@ -377,7 +394,7 @@ local function walkDirect(targetPos)
 
         if (currentHrp.Position - lastPos).Magnitude < 0.15 then
             stuckTimer += dt
-            if stuckTimer > 2.5 then
+            if stuckTimer > 4 then
                 State.IsMoving = false
                 if conn then conn:Disconnect() end
                 return
@@ -401,7 +418,7 @@ local function walkPathfind(targetPos)
     if State.IsMoving then return false end
     State.IsMoving = true
     State.LastPathBuild = tick()
-    State.CurrentTargetPos = targetPos
+    State.MoveStartedAt = tick()
 
     local _, hum, hrp = getCharacter()
     if not hum or not hrp then
@@ -444,13 +461,8 @@ local function walkPathfind(targetPos)
 
     if #filteredPoints == 0 then
         State.IsMoving = false
-        return false
+        return walkDirect(targetPos)
     end
-
-    local blockedConn = path.Blocked:Connect(function()
-        -- намеренно ничего не делаем,
-        -- чтобы не срывать путь, если цель исчезла по дороге
-    end)
 
     local currentPointIdx = 1
     local lastPos = hrp.Position
@@ -470,18 +482,22 @@ local function walkPathfind(targetPos)
             return
         end
 
-        local target = filteredPoints[currentPointIdx]
-        if not target then
+        local distToGoal = (currentHrp.Position - targetPos).Magnitude
+        if distToGoal <= CONFIG.CollectionRadius then
             State.IsMoving = false
             if heartbeatConn then heartbeatConn:Disconnect() end
             return
         end
 
-        local dist = (currentHrp.Position - target.Position).Magnitude
+        local target = filteredPoints[currentPointIdx]
+        if not target then
+            hum:MoveTo(targetPos)
+            return
+        end
 
         if (currentHrp.Position - lastPos).Magnitude < 0.15 then
             stuckTimer += dt
-            if stuckTimer > 2.5 then
+            if stuckTimer > 4 then
                 State.IsMoving = false
                 if heartbeatConn then heartbeatConn:Disconnect() end
                 return
@@ -491,14 +507,14 @@ local function walkPathfind(targetPos)
             lastPos = currentHrp.Position
         end
 
+        local dist = (currentHrp.Position - target.Position).Magnitude
         if dist < 3 then
             currentPointIdx += 1
-            if currentPointIdx > #filteredPoints then
-                State.IsMoving = false
-                if heartbeatConn then heartbeatConn:Disconnect() end
+            target = filteredPoints[currentPointIdx]
+            if not target then
+                hum:MoveTo(targetPos)
                 return
             end
-            target = filteredPoints[currentPointIdx]
         end
 
         hum:MoveTo(target.Position)
@@ -512,7 +528,6 @@ local function walkPathfind(targetPos)
         task.wait(0.05)
     end
 
-    if blockedConn then blockedConn:Disconnect() end
     if heartbeatConn then heartbeatConn:Disconnect() end
     clearPathVisuals()
 
@@ -524,9 +539,9 @@ local function walkTo(targetPos, egg)
     local _, _, hrp = getCharacter()
     if not hrp then return false end
 
-    State.CurrentTarget = egg
-    local dist = (hrp.Position - targetPos).Magnitude
+    lockTarget(egg, targetPos)
 
+    local dist = (hrp.Position - targetPos).Magnitude
     if dist < CONFIG.MinDirectWalk then
         return walkDirect(targetPos)
     else
@@ -612,24 +627,45 @@ local function mainLoop()
 
         updateESP()
 
-        if State.IsMoving then continue end
-        if tick() - State.LastPathBuild < CONFIG.PathCooldown then continue end
-        if tick() - State.LastArrivalTime < 0.5 then continue end
+        if State.IsMoving then
+            continue
+        end
 
-        local egg, dist = getNearestEgg()
+        if tick() - State.LastPathBuild < CONFIG.PathCooldown then
+            continue
+        end
 
-        if egg and isEggAvailable(egg) then
-            local eggPos = getPosition(egg)
-            if eggPos then
-                if dist > CONFIG.CollectionRadius then
-                    walkTo(eggPos, egg)
-                else
-                    collectEgg(egg)
-                    State.LastArrivalTime = tick()
+        if tick() - State.LastArrivalTime < 0.2 then
+            continue
+        end
+
+        local targetEgg = State.CurrentTarget
+        local targetPos = State.CurrentTargetPos
+
+        if not targetPos then
+            local egg = getNearestEgg()
+            if egg then
+                targetEgg = egg
+                targetPos = getPosition(egg)
+                if targetPos then
+                    lockTarget(targetEgg, targetPos)
                 end
             end
-        else
-            State.CurrentTarget = nil
+        end
+
+        if targetPos then
+            local dist = (hrp.Position - targetPos).Magnitude
+
+            if dist > CONFIG.CollectionRadius then
+                walkTo(targetPos, targetEgg)
+            else
+                if targetEgg then
+                    collectEgg(targetEgg)
+                    markAsCollected(targetEgg)
+                end
+                unlockTarget()
+                State.LastArrivalTime = tick()
+            end
         end
     end
 end
