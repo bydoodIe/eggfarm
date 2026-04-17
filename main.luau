@@ -2,7 +2,6 @@ local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 local camera = Workspace.CurrentCamera
@@ -13,17 +12,13 @@ local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local Window = Rayfield:CreateWindow({
     Name = "Egg Collector",
     LoadingTitle = "Egg Hunter",
-    LoadingSubtitle = "by Sirius",
+    LoadingSubtitle = "EasterEggs Edition",
     ConfigurationSaving = {
         Enabled = true,
         FolderName = "EggHunt",
         FileName = "Config"
     },
-    Discord = {
-        Enabled = false,
-        Invite = "noinvitelink",
-        RememberJoins = true
-    },
+    Discord = { Enabled = false, Invite = "", RememberJoins = true },
     KeySystem = false
 })
 
@@ -35,33 +30,28 @@ local SettingsTab = Window:CreateTab("Settings", 4483362458)
 local CONFIG = {
     Enabled = false,
     ESP = true,
-    ESPColor = Color3.fromRGB(0, 255, 255),
+    ESPColor = Color3.fromRGB(255, 105, 180), -- Розовый для пасхальных яиц
     ESPTextSize = 14,
     CollectionRadius = 8,
-    AgentRadius = 2,
+    AgentRadius = 2.5,
     AgentHeight = 5,
     AgentCanJump = true,
     VisualizePath = false,
     PathColor = Color3.fromRGB(255, 255, 0),
     IgnoreCollected = true,
-    CheckInterval = 0.3,
-    MaxSearchRadius = 500,
+    CheckInterval = 0.2,
+    MaxSearchRadius = 1000,
     
-    -- Пути к яйцам (проверяются по порядку)
-    EggPaths = {
-        Workspace:FindFirstChild("Hunts") and Workspace.Hunts:FindFirstChild("Eggs"),
-        Workspace:FindFirstChild("Eggs"),
-        Workspace:FindFirstChild("Hunts") and Workspace.Hunts:FindFirstChild("Egg"),
-        ReplicatedStorage:FindFirstChild("Hunts") and ReplicatedStorage.Hunts:FindFirstChild("Egg"),
-    }
+    -- === ОСНОВНАЯ ПАПКА С ЯЙЦАМИ ===
+    EggFolder = Workspace:WaitForChild("EasterEggs", 10) -- Ждём загрузки до 10 сек
 }
 
 -- ==================== СОСТОЯНИЕ ====================
 local State = {
     IsMoving = false,
     CurrentTarget = nil,
-    CollectedEggs = {}, -- ID собранных яиц
-    ESPObjects = {},    -- Хранилище ESP объектов
+    CollectedEggs = {},
+    ESPObjects = {},
     PathVisuals = {},
     LastCheck = 0
 }
@@ -93,26 +83,24 @@ end
 function isValidEgg(obj)
     if not (obj:IsA("BasePart") or obj:IsA("Model")) then return false end
     if not obj.Parent then return false end
-    
-    local name = obj.Name:lower()
-    return name:find("egg") or name:find("hunt") or name:find("яйцо")
+    -- Пасхальные яйца могут называться по-разному, собираем всё из папки
+    return true
 end
 
 function getEggID(egg)
-    -- Уникальный ID для отслеживания
-    return egg:GetFullName() .. "_" .. tostring(egg.LayoutOrder or 0)
+    return egg:GetFullName()
 end
 
 -- ==================== ПРОВЕРКА ЗАНЯТОСТИ ====================
 
 function isEggAvailable(egg)
     if not CONFIG.IgnoreCollected then return true end
+    if not egg or not egg.Parent then return false end
     
     local id = getEggID(egg)
     
-    -- Проверяем в локальном списке собранных
+    -- Проверяем кэш (30 сек защита от повторного сбора)
     if State.CollectedEggs[id] then
-        -- Проверяем, не появилось ли яйцо снова (таймер респавна)
         if tick() - State.CollectedEggs[id] > 30 then
             State.CollectedEggs[id] = nil
             return true
@@ -120,43 +108,60 @@ function isEggAvailable(egg)
         return false
     end
     
-    -- Проверяем видимость и доступность
-    local pos = getPosition(egg)
-    if not pos then return false end
-    
-    -- Проверяем, не собрал ли кто-то другой (исчезло ли яйцо)
-    if egg:IsA("BasePart") and egg.Transparency >= 1 then
-        State.CollectedEggs[id] = tick()
-        return false
+    -- Проверяем, не собрал ли кто-то другой
+    if egg:IsA("BasePart") then
+        if egg.Transparency >= 1 then
+            State.CollectedEggs[id] = tick()
+            return false
+        end
+        if not egg.CanCollide and egg.Transparency > 0.8 then
+            State.CollectedEggs[id] = tick()
+            return false
+        end
     end
     
-    -- Проверяем CanCollide и другие свойства
-    if egg:IsA("BasePart") and not egg.CanCollide and egg.Transparency > 0.8 then
-        State.CollectedEggs[id] = tick()
-        return false
+    -- Проверка для Model: ищем видимые части
+    if egg:IsA("Model") then
+        local visible = false
+        for _, part in ipairs(egg:GetDescendants()) do
+            if part:IsA("BasePart") and part.Transparency < 1 then
+                visible = true
+                break
+            end
+        end
+        if not visible then
+            State.CollectedEggs[id] = tick()
+            return false
+        end
     end
     
     return true
 end
 
 function markAsCollected(egg)
-    local id = getEggID(egg)
-    State.CollectedEggs[id] = tick()
+    if not egg then return end
+    State.CollectedEggs[getEggID(egg)] = tick()
     State.CurrentTarget = nil
 end
 
 -- ==================== ПОИСК ЯИЦ ====================
 
-function findEggFolder()
-    for _, folder in ipairs(CONFIG.EggPaths) do
-        if folder then return folder end
-    end
-    return Workspace
-end
-
 function findAllEggs()
     local eggs = {}
-    local folder = findEggFolder()
+    local folder = CONFIG.EggFolder
+    
+    if not folder or not folder.Parent then 
+        -- Пытаемся найти папку снова
+        local success, result = pcall(function()
+            return Workspace:WaitForChild("EasterEggs", 2)
+        end)
+        if success and result then
+            CONFIG.EggFolder = result
+            folder = result
+        else
+            return eggs
+        end
+    end
     
     for _, obj in ipairs(folder:GetDescendants()) do
         if isValidEgg(obj) and isEggAvailable(obj) then
@@ -164,22 +169,11 @@ function findAllEggs()
         end
     end
     
-    -- Также проверяем ReplicatedStorage на скрытые яйца
-    local rsFolder = ReplicatedStorage:FindFirstChild("Hunts")
-    if rsFolder then
-        for _, obj in ipairs(rsFolder:GetDescendants()) do
-            if isValidEgg(obj) and not table.find(eggs, obj) then
-                -- Проверяем, есть ли клон в Workspace
-                local existsInWorkspace = false
-                for _, egg in ipairs(eggs) do
-                    if egg.Name == obj.Name then
-                        existsInWorkspace = true
-                        break
-                    end
-                end
-                if not existsInWorkspace then
-                    table.insert(eggs, obj)
-                end
+    -- Также проверяем прямые дети (если яйца лежат сразу в папке)
+    for _, obj in ipairs(folder:GetChildren()) do
+        if isValidEgg(obj) and isEggAvailable(obj) then
+            if not table.find(eggs, obj) then
+                table.insert(eggs, obj)
             end
         end
     end
@@ -200,16 +194,15 @@ function getNearestEgg()
         if pos then
             local dist = (myPos - pos).Magnitude
             if dist < minDist then
-                -- Проверяем линию видимости
+                -- Лучевая проверка (опционально, можно убрать если лагает)
                 local rayParams = RaycastParams.new()
                 rayParams.FilterDescendantsInstances = {char}
                 rayParams.FilterType = Enum.RaycastFilterType.Blacklist
                 
-                local direction = (pos - myPos).Unit * dist
-                local rayResult = Workspace:Raycast(myPos, direction, rayParams)
+                local dir = (pos - myPos).Unit * dist
+                local result = Workspace:Raycast(myPos, dir, rayParams)
                 
-                -- Если нет препятствий или расстояние маленькое — берём
-                if not rayResult or rayResult.Distance > dist - 2 or dist < 20 then
+                if not result or result.Distance > dist - 3 or dist < 15 then
                     minDist = dist
                     nearest = egg
                 end
@@ -224,12 +217,13 @@ end
 
 function createESP(egg)
     if State.ESPObjects[egg] then return end
+    if not CONFIG.ESP then return end
     
     local billboard = Instance.new("BillboardGui")
-    billboard.Name = "EggESP"
+    billboard.Name = "EasterEggESP"
     billboard.AlwaysOnTop = true
-    billboard.Size = UDim2.new(0, 100, 0, 50)
-    billboard.StudsOffset = Vector3.new(0, 3, 0)
+    billboard.Size = UDim2.new(0, 120, 0, 50)
+    billboard.StudsOffset = Vector3.new(0, 2.5, 0)
     billboard.MaxDistance = CONFIG.MaxSearchRadius
     
     local label = Instance.new("TextLabel")
@@ -239,15 +233,33 @@ function createESP(egg)
     label.Font = Enum.Font.GothamBold
     label.TextColor3 = CONFIG.ESPColor
     label.TextSize = CONFIG.ESPTextSize
-    label.TextStrokeTransparency = 0.5
-    label.Text = "🥚 " .. egg.Name .. "\n" .. math.floor((getPosition(egg) - (getCharacter() and getCharacter().Position or Vector3.zero)).Magnitude) .. "m"
+    label.TextStrokeTransparency = 0.3
+    label.Text = "🥚 " .. egg.Name .. "\n...m"
     
-    -- Дистанция обновляется
+    -- Фон для читаемости
+    local bg = Instance.new("Frame")
+    bg.Name = "Bg"
+    bg.BackgroundColor3 = Color3.new(0, 0, 0)
+    bg.BackgroundTransparency = 0.7
+    bg.BorderSizePixel = 0
+    bg.Size = UDim2.new(1, 0, 1, 0)
+    bg.ZIndex = -1
+    bg.Parent = label
+    
+    label.Parent = billboard
+    
     local connection = RunService.Heartbeat:Connect(function()
         if not egg or not egg.Parent or not CONFIG.ESP then
             billboard:Destroy()
             State.ESPObjects[egg] = nil
             return
+        end
+        
+        if not isEggAvailable(egg) then
+            billboard.Enabled = false
+            return
+        else
+            billboard.Enabled = true
         end
         
         local pos = getPosition(egg)
@@ -256,26 +268,27 @@ function createESP(egg)
             local dist = (pos - hrp.Position).Magnitude
             label.Text = "🥚 " .. egg.Name .. "\n" .. math.floor(dist) .. "m"
             
-            -- Меняем цвет в зависимости от дистанции
-            if dist < CONFIG.CollectionRadius then
-                label.TextColor3 = Color3.fromRGB(0, 255, 0) -- Зелёный (рядом)
-            elseif State.CurrentTarget == egg then
-                label.TextColor3 = Color3.fromRGB(255, 255, 0) -- Жёлтый (цель)
+            if State.CurrentTarget == egg then
+                label.TextColor3 = Color3.fromRGB(255, 255, 0)
+                bg.BackgroundColor3 = Color3.fromRGB(50, 50, 0)
+            elseif dist < CONFIG.CollectionRadius then
+                label.TextColor3 = Color3.fromRGB(0, 255, 0)
+                bg.BackgroundColor3 = Color3.fromRGB(0, 50, 0)
             else
-                label.TextColor3 = CONFIG.ESPColor -- Стандартный
+                label.TextColor3 = CONFIG.ESPColor
+                bg.BackgroundColor3 = Color3.new(0, 0, 0)
             end
         end
     end)
     
-    label.Parent = billboard
-    
-    -- Привязываем к яйцу или создаём Attachment
     local part = egg:IsA("BasePart") and egg or egg:FindFirstChildWhichIsA("BasePart")
     if part then
         billboard.Adornee = part
+        billboard.Parent = part
+    else
+        billboard.Parent = Workspace
     end
     
-    billboard.Parent = egg:IsA("BasePart") and egg or (part or Workspace)
     State.ESPObjects[egg] = {Gui = billboard, Connection = connection}
 end
 
@@ -294,7 +307,7 @@ function updateESP()
         createESP(egg)
     end
     
-    -- Удаляем ESP для исчезнувших яиц
+    -- Чистим исчезнувшие
     for egg, data in pairs(State.ESPObjects) do
         if not egg.Parent or not isEggAvailable(egg) then
             data.Gui:Destroy()
@@ -320,19 +333,19 @@ function drawPath(waypoints)
     for i, wp in ipairs(waypoints) do
         local ball = Instance.new("Part")
         ball.Shape = Enum.PartType.Ball
-        ball.Size = Vector3.new(0.3, 0.3, 0.3)
-        ball.Position = wp.Position + Vector3.new(0, 0.5, 0)
+        ball.Size = Vector3.new(0.4, 0.4, 0.4)
+        ball.Position = wp.Position + Vector3.new(0, 0.3, 0)
         ball.Anchored = true
         ball.CanCollide = false
         ball.Material = Enum.Material.Neon
         ball.Color = (i == #waypoints) and Color3.fromRGB(0, 255, 0) or CONFIG.PathColor
-        ball.Transparency = 0.3
+        ball.Transparency = 0.2
         ball.Parent = Workspace
         table.insert(State.PathVisuals, ball)
     end
 end
 
-function walkTo(targetPos, callback)
+function walkTo(targetPos, onArrive)
     if State.IsMoving then return false end
     State.IsMoving = true
     
@@ -342,23 +355,20 @@ function walkTo(targetPos, callback)
         return false 
     end
     
-    local pathParams = {
+    local path = PathfindingService:CreatePath({
         AgentRadius = CONFIG.AgentRadius,
         AgentHeight = CONFIG.AgentHeight,
         AgentCanJump = CONFIG.AgentCanJump,
-        Costs = {
-            Water = 20,
-            DangerZone = math.huge
-        }
-    }
+        AgentJumpHeight = 8,
+        Costs = {}
+    })
     
-    local path = PathfindingService:CreatePath(pathParams)
-    local success, err = pcall(function()
+    local success = pcall(function()
         path:ComputeAsync(hrp.Position, targetPos)
     end)
     
     if not success or path.Status ~= Enum.PathStatus.Success then
-        -- Fallback: прямое движение
+        -- Fallback
         hum:MoveTo(targetPos)
         State.IsMoving = false
         return false
@@ -373,15 +383,16 @@ function walkTo(targetPos, callback)
     drawPath(waypoints)
     
     local blockedConn = path.Blocked:Connect(function(blockedIdx)
-        if blockedIdx > 1 then
+        if blockedIdx >= 2 then
             State.IsMoving = false
         end
     end)
     
-    -- Движение по точкам
     for i = 2, #waypoints do
         if not State.IsMoving then break end
-        if not isEggAvailable(State.CurrentTarget) then
+        
+        -- Проверяем, не украли ли яйцо по дороге
+        if State.CurrentTarget and not isEggAvailable(State.CurrentTarget) then
             State.IsMoving = false
             break
         end
@@ -390,6 +401,7 @@ function walkTo(targetPos, callback)
         
         if wp.Action == Enum.PathWaypointAction.Jump then
             hum:ChangeState(Enum.HumanoidStateType.Jumping)
+            task.wait(0.1)
         end
         
         hum:MoveTo(wp.Position)
@@ -405,7 +417,7 @@ function walkTo(targetPos, callback)
     clearPathVisuals()
     State.IsMoving = false
     
-    if callback then callback() end
+    if onArrive then onArrive() end
     return true
 end
 
@@ -414,48 +426,49 @@ end
 function collectEgg(egg)
     if not egg or not egg.Parent then 
         markAsCollected(egg)
-        return false 
+        return true 
     end
     
-    local collected = false
+    local char = player.Character
+    if not char then return false end
     
     -- ProximityPrompt
     local prompt = egg:FindFirstChildWhichIsA("ProximityPrompt", true)
     if prompt then
-        pcall(function()
-            fireproximityprompt(prompt)
-            collected = true
-        end)
+        pcall(fireproximityprompt, prompt)
     end
     
     -- ClickDetector
     local click = egg:FindFirstChildWhichIsA("ClickDetector", true)
     if click then
-        pcall(function()
-            fireclickdetector(click)
-            collected = true
-        end)
+        pcall(fireclickdetector, click)
     end
     
-    -- TouchInterest
+    -- Touch
+    local hrp = char:FindFirstChild("HumanoidRootPart")
     local part = egg:IsA("BasePart") and egg or egg:FindFirstChildWhichIsA("BasePart")
-    if part then
+    if hrp and part then
         pcall(function()
-            firetouchinterest(player.Character.HumanoidRootPart, part, 0)
-            task.wait(0.1)
-            firetouchinterest(player.Character.HumanoidRootPart, part, 1)
-            collected = true
+            firetouchinterest(hrp, part, 0)
+            task.wait(0.05)
+            firetouchinterest(hrp, part, 1)
         end)
     end
     
-    -- Проверяем, собрали ли
-    task.wait(0.3)
-    if not egg.Parent or (egg:IsA("BasePart") and egg.Transparency >= 1) then
+    -- Проверяем результат
+    task.wait(0.2)
+    if not egg.Parent then
         markAsCollected(egg)
         return true
     end
     
-    return collected
+    -- Повторная проверка через прозрачность
+    if egg:IsA("BasePart") and egg.Transparency >= 1 then
+        markAsCollected(egg)
+        return true
+    end
+    
+    return false
 end
 
 -- ==================== ГЛАВНЫЙ ЦИКЛ ====================
@@ -478,26 +491,22 @@ function mainLoop()
         
         updateESP()
         
-        -- Если уже идём — пропускаем
         if State.IsMoving then continue end
         
         local egg, dist = getNearestEgg()
         
-        if egg then
+        if egg and isEggAvailable(egg) then
             State.CurrentTarget = egg
             local eggPos = getPosition(egg)
             
             if eggPos then
                 if dist > CONFIG.CollectionRadius then
-                    -- Идём к яйцу
                     walkTo(eggPos, function()
-                        -- По прибытии пытаемся собрать
-                        if isEggAvailable(egg) then
+                        if egg and egg.Parent and isEggAvailable(egg) then
                             collectEgg(egg)
                         end
                     end)
                 else
-                    -- Уже рядом — собираем
                     collectEgg(egg)
                 end
             end
@@ -507,7 +516,7 @@ function mainLoop()
     end
 end
 
--- ==================== UI ЭЛЕМЕНТЫ ====================
+-- ==================== UI ====================
 
 MainTab:CreateToggle({
     Name = "Auto Collect",
@@ -519,7 +528,7 @@ MainTab:CreateToggle({
 })
 
 MainTab:CreateToggle({
-    Name = "Ignore Collected",
+    Name = "Ignore Already Collected",
     CurrentValue = true,
     Flag = "IgnoreCollected",
     Callback = function(Value)
@@ -540,7 +549,7 @@ MainTab:CreateSlider({
 })
 
 VisualTab:CreateToggle({
-    Name = "ESP Enabled",
+    Name = "Egg ESP",
     CurrentValue = true,
     Flag = "ESPEnabled",
     Callback = function(Value)
@@ -565,7 +574,7 @@ VisualTab:CreateColorPicker({
 })
 
 VisualTab:CreateToggle({
-    Name = "Visualize Path",
+    Name = "Show Path",
     CurrentValue = false,
     Flag = "VisualizePath",
     Callback = function(Value)
@@ -576,10 +585,10 @@ VisualTab:CreateToggle({
 
 SettingsTab:CreateSlider({
     Name = "Max Search Radius",
-    Range = {100, 2000},
+    Range = {50, 2000},
     Increment = 50,
     Suffix = "studs",
-    CurrentValue = 500,
+    CurrentValue = 1000,
     Flag = "MaxRadius",
     Callback = function(Value)
         CONFIG.MaxSearchRadius = Value
@@ -587,11 +596,11 @@ SettingsTab:CreateSlider({
 })
 
 SettingsTab:CreateSlider({
-    Name = "Check Interval",
+    Name = "Check Speed",
     Range = {0.1, 1},
     Increment = 0.1,
     Suffix = "s",
-    CurrentValue = 0.3,
+    CurrentValue = 0.2,
     Flag = "CheckInterval",
     Callback = function(Value)
         CONFIG.CheckInterval = Value
@@ -599,12 +608,12 @@ SettingsTab:CreateSlider({
 })
 
 SettingsTab:CreateButton({
-    Name = "Clear Collected Cache",
+    Name = "Reset Collected Cache",
     Callback = function()
         State.CollectedEggs = {}
         Rayfield:Notify({
-            Title = "Cache Cleared",
-            Content = "Collected eggs list has been reset",
+            Title = "Cache Reset",
+            Content = "Collected eggs memory cleared!",
             Duration = 3
         })
     end
@@ -614,8 +623,9 @@ SettingsTab:CreateButton({
 
 task.spawn(mainLoop)
 
+local initialEggs = findAllEggs()
 Rayfield:Notify({
-    Title = "Egg Collector Loaded",
-    Content = "Found " .. #findAllEggs() .. " eggs nearby",
+    Title = "EasterEggs Loaded",
+    Content = "Found " .. #initialEggs .. " eggs in Workspace.EasterEggs",
     Duration = 5
 })
