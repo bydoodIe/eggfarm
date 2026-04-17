@@ -1,44 +1,41 @@
---// Загрузка Rayfield
+--// Rayfield
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
---// Создание окна
 local Window = Rayfield:CreateWindow({
     Name = "Easter Egg Auto-Farm",
     LoadingTitle = "Easter Eggs",
-    LoadingSubtitle = "Auto farm + ESP",
+    LoadingSubtitle = "Fixed v2",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false
 })
 
---// Вкладки
-local MainTab    = Window:CreateTab("Main", 4483362458)
-local VisualTab  = Window:CreateTab("ESP", 4483362458)
-local SetTab     = Window:CreateTab("Settings", 4483362458)
+local MainTab   = Window:CreateTab("Main", 4483362458)
+local VisualTab = Window:CreateTab("ESP", 4483362458)
+local SetTab    = Window:CreateTab("Settings", 4483362458)
 
 --// Переменные
-local player     = game.Players.LocalPlayer
-local char       = player.Character or player.CharacterAdded:Wait()
+local plr        = game.Players.LocalPlayer
+local char       = plr.Character or plr.CharacterAdded:Wait()
 local hrp        = char:WaitForChild("HumanoidRootPart")
-local humanoid   = char:WaitForChild("Humanoid")
+local hum        = char:WaitForChild("Humanoid")
 
 local autoFarm   = false
 local espEnabled = false
 local farmSpeed  = 16
-local espCache   = {}
+local currentTarget = nil
+local espCache = {}
 
---// Обновление персонажа после респавна
-player.CharacterAdded:Connect(function(newChar)
-    char = newChar
-    hrp = char:WaitForChild("HumanoidRootPart")
-    humanoid = char:WaitForChild("Humanoid")
+plr.CharacterAdded:Connect(function(c)
+    char = c
+    hrp  = c:WaitForChild("HumanoidRootPart")
+    hum  = c:WaitForChild("Humanoid")
 end)
 
---// Получение списка яиц (ищет все BasePart в workspace.EasterEggs)
+--// Получить все живые яйца прямо сейчас
 local function getEggs()
     local eggs = {}
     local folder = workspace:FindFirstChild("EasterEggs")
     if not folder then return eggs end
-
     for _, obj in ipairs(folder:GetDescendants()) do
         if obj:IsA("BasePart") or obj:IsA("MeshPart") then
             table.insert(eggs, obj)
@@ -47,74 +44,85 @@ local function getEggs()
     return eggs
 end
 
---// Движение к яйцу напрямую, игнорируя стены и рельеф (noclip + прямой полёт)
-local function goToEgg(egg)
-    if not egg or not egg.Parent then return end
+--// Ближайшее яйко
+local function getClosestEgg()
+    local eggs = getEggs()
+    if #eggs == 0 then return nil end
+    local closest, minDist = nil, math.huge
+    local pos = hrp and hrp.Position
+    if not pos then return nil end
 
-    while autoFarm and egg and egg.Parent do
-        if not hrp or not hrp.Parent then break end
-
-        local dist = (egg.Position - hrp.Position).Magnitude
-        if dist < 5 then break end -- Добрались до яйца
-
-        -- Вектор к цели
-        local dir = (egg.Position - hrp.Position).Unit
-
-        -- Движение напрямую (сквозь стены и воздух)
-        hrp.AssemblyLinearVelocity = dir * farmSpeed
-        hrp.CFrame = CFrame.lookAt(hrp.Position, egg.Position)
-
-        -- Noclip: отключаем коллизии у всего персонажа
-        for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") then
-                part.CanCollide = false
-            end
+    for _, egg in ipairs(eggs) do
+        if not egg or not egg.Parent then continue end
+        local d = (egg.Position - pos).Magnitude
+        if d < minDist then
+            minDist = d
+            closest = egg
         end
-
-        task.wait()
     end
+    return closest
 end
 
---// Основной цикл фарма
-local function farmLoop()
-    while autoFarm do
-        local eggs = getEggs()
-        if #eggs == 0 then
-            Rayfield:Notify({ Title = "Внимание", Content = "Яйца не найдены!", Duration = 3 })
-            task.wait(2)
-            continue
-        end
-
-        for _, egg in ipairs(eggs) do
-            if not autoFarm then break end
-            if not (egg and egg.Parent) then continue end
-
-            goToEgg(egg)
-            task.wait(0.2) -- Короткая пауза после "сбора"
-        end
-
-        task.wait(0.3)
-    end
-
-    -- Сброс после остановки
-    if hrp then
-        hrp.AssemblyLinearVelocity = Vector3.zero
-    end
-    if char then
-        for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") then
-                part.CanCollide = true
+--// ДВИЖЕНИЕ: Heartbeat + CFrame (не зависит от Humanoid)
+local RS = game:GetService("RunService")
+RS.Heartbeat:Connect(function(dt)
+    if not autoFarm then
+        if currentTarget then
+            currentTarget = nil
+            if hum then
+                hum.PlatformStand = false
+                hum.AutoRotate = true
+            end
+            if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+            -- Вернуть коллизии
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = true end
             end
         end
+        return
     end
-end
 
---// ESP: создание подсветки и метки
+    if not hrp or not hum or not char then return end
+
+    -- Noclip + убиваем контроль Humanoid (он мешает скорости)
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then
+            p.CanCollide = false
+        end
+    end
+    hum.PlatformStand = true
+    hum.AutoRotate = false
+
+    -- Цель пропала? — берём ближайшую новую мгновенно
+    if not currentTarget or not currentTarget.Parent then
+        currentTarget = getClosestEgg()
+        if not currentTarget then return end
+    end
+
+    local pos  = hrp.Position
+    local tPos = currentTarget.Position
+    local dist = (tPos - pos).Magnitude
+
+    -- Дошли — считаем "собрано", сразу ищем следующее
+    if dist < 4 then
+        currentTarget = nil
+        return
+    end
+
+    local dir  = (tPos - pos).Unit
+    local step = farmSpeed * dt          -- честные studs/sec
+    if step > dist then step = dist end  -- не пролетаем мимо
+
+    hrp.CFrame = CFrame.new(pos + dir * step, tPos)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+end)
+
+--// ESP (динамически обновляется)
 local function makeESP(egg)
     if espCache[egg] then return end
 
     local hl = Instance.new("Highlight")
-    hl.Name = "EggESP_HL"
+    hl.Name = "EggESP"
     hl.FillColor = Color3.fromRGB(255, 255, 0)
     hl.OutlineColor = Color3.fromRGB(255, 215, 0)
     hl.FillTransparency = 0.4
@@ -133,20 +141,21 @@ local function makeESP(egg)
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(1, 0, 1, 0)
     lbl.BackgroundTransparency = 1
-    lbl.Text = "🥚 EGG\n" .. math.floor((egg.Position - hrp.Position).Magnitude) .. " studs"
+    lbl.Text = "🥚 EGG"
     lbl.TextColor3 = Color3.fromRGB(255, 255, 0)
     lbl.TextStrokeTransparency = 0
     lbl.TextScaled = true
     lbl.Font = Enum.Font.GothamBold
     lbl.Parent = bb
 
-    espCache[egg] = { Highlight = hl, Billboard = bb, Label = lbl }
+    espCache[egg] = { hl = hl, bb = bb, lbl = lbl }
 end
 
 local function clearESP(egg)
-    local data = espCache[egg]
-    if data then
-        for _, v in pairs(data) do pcall(function() v:Destroy() end) end
+    local d = espCache[egg]
+    if d then
+        pcall(function() d.hl:Destroy() end)
+        pcall(function() d.bb:Destroy() end)
         espCache[egg] = nil
     end
 end
@@ -163,44 +172,38 @@ local function updateESP()
     for _, egg in ipairs(eggs) do
         active[egg] = true
         makeESP(egg)
-        -- Обновляем дистанцию на метке
-        local data = espCache[egg]
-        if data and data.Label then
-            data.Label.Text = "🥚 EGG\n" .. math.floor((egg.Position - hrp.Position).Magnitude) .. " studs"
+        local d = espCache[egg]
+        if d and hrp then
+            d.lbl.Text = "🥚 EGG\n" .. math.floor((egg.Position - hrp.Position).Magnitude) .. " studs"
         end
     end
 
-    -- Удаляем ESP для пропавших яиц
+    -- Удаляем ESP у пропавших
     for egg, _ in pairs(espCache) do
         if not active[egg] then clearESP(egg) end
     end
 end
 
---// UI: Тоггл Auto Farm
+--// UI
 MainTab:CreateToggle({
     Name = "Auto Farm Easter Eggs",
     CurrentValue = false,
-    Flag = "AutoFarmToggle",
-    Callback = function(Value)
-        autoFarm = Value
-        if Value then
-            task.spawn(farmLoop)
-        end
+    Callback = function(v)
+        autoFarm = v
+        if not v then currentTarget = nil end
     end
 })
 
---// UI: Тоггл ESP
 VisualTab:CreateToggle({
-    Name = "Egg ESP (Highlight + Name)",
+    Name = "Egg ESP",
     CurrentValue = false,
-    Flag = "ESPToggle",
-    Callback = function(Value)
-        espEnabled = Value
-        if Value then
+    Callback = function(v)
+        espEnabled = v
+        if v then
             task.spawn(function()
                 while espEnabled do
                     updateESP()
-                    task.wait(0.2)
+                    task.wait(0.25)
                 end
             end)
         else
@@ -209,26 +212,18 @@ VisualTab:CreateToggle({
     end
 })
 
---// UI: Слайдер скорости (14-24) в отдельной вкладке Settings
 SetTab:CreateSlider({
     Name = "Movement Speed",
     Range = {14, 24},
     Increment = 1,
     Suffix = "studs/sec",
     CurrentValue = 16,
-    Flag = "SpeedSlider",
-    Callback = function(Value)
-        farmSpeed = Value
+    Callback = function(v)
+        farmSpeed = v
     end
 })
 
---// Anti-AFK (чтобы не кикало за бездействие)
-for _, conn in pairs(getconnections(player.Idled)) do
-    conn:Disable()
-end
+--// Anti-AFK
+for _, c in pairs(getconnections(plr.Idled)) do c:Disable() end
 
-Rayfield:Notify({
-    Title = "Script Loaded",
-    Content = "Auto Farm & ESP готовы к работе",
-    Duration = 5
-})
+Rayfield:Notify({ Title = "Loaded", Content = "Fixed v2 ready — speed & dynamic eggs", Duration = 5 })
